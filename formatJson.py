@@ -21,7 +21,7 @@ def format_json(obj, indent=0):
 
             lines.append(f'{"  " * (indent + 1)}"{k}": {formatted}{comma}')
 
-        lines.append(f"{space}}}")
+        lines.append(f"{space}")
         return "\n".join(lines)
 
     elif isinstance(obj, list):
