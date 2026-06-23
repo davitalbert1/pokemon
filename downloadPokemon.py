@@ -4,6 +4,7 @@ import requests
 import time
 import hashlib
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
@@ -43,38 +44,58 @@ def sprites_complete(folder, sprite_map):
     return True
 
 TCG_BASE = "https://api.pokemontcg.io/v2"
+TCG_LOCK = threading.Lock()
+LAST_TCG_CALL = 0.0
+TCG_API_KEY = os.environ.get("POKEMON_TCG_API_KEY") or os.environ.get("TCG_API_KEY")
 
 @lru_cache(maxsize=None)
 def get_cards_api_cached(url, query_string):
+    headers = {}
+    if TCG_API_KEY:
+        headers["X-Api-Key"] = TCG_API_KEY
     r = SESSION.get(
         url,
         params={"q": query_string},
+        headers=headers,
         timeout=(10, 90)
     )
     r.raise_for_status()
     return r.json()
 
 def cards_complete(folder, manifest):
+    expected = manifest.get("cards", [])
+    if not expected: return True
+
     cards_folder = folder / "cards"
     if not cards_folder.exists(): return False
-    expected = manifest.get("cards", [])
-    if not expected: return False
 
     for card in expected:
-        file_path = cards_folder / f"{card['id']}.jpg"
+        file_path = cards_folder / f"{safe_filename(card['id'])}.jpg"
         if not file_path.exists(): return False
 
     return True
 
-@lru_cache(maxsize=None)
-def fetch_cards(name, retries=3):
+def fetch_cards(name, retries=5):
+    global LAST_TCG_CALL
     for attempt in range(retries):
-        try:
-            data = get_cards_api_cached(f"{TCG_BASE}/cards", f'name:"{name}"')
-            return data.get("data", [])
-        except Exception as e:
-            print(f"Erro fetch_cards {name} tentativa {attempt+1}: {e}")
-            time.sleep(2 ** attempt)
+        with TCG_LOCK:
+            if not TCG_API_KEY:
+                # Rate limit: max 30 requests per minute -> 1 request every 2 seconds
+                now = time.time()
+                elapsed = now - LAST_TCG_CALL
+                if elapsed < 2.0:
+                    time.sleep(2.0 - elapsed)
+            
+            try:
+                data = get_cards_api_cached(f"{TCG_BASE}/cards", f'name:"{name}"')
+                LAST_TCG_CALL = time.time()
+                return data.get("data", [])
+            except Exception as e:
+                print(f"Erro fetch_cards {name} tentativa {attempt+1}: {e}")
+                LAST_TCG_CALL = time.time()
+                if attempt < retries - 1:
+                    sleep_time = (2 ** attempt) * 5
+                    time.sleep(sleep_time)
 
     return []
 
@@ -141,7 +162,7 @@ def download_file(url, path):
         print(f"Erro ao baixar {url}: {e}")
 
 def extract_sprites(pokemon_data):
-    sprites = pokemon_data.get("sprites", {})
+    sprites = pokemon_data.get("sprites", {}) if isinstance(pokemon_data, dict) and "sprites" in pokemon_data else pokemon_data
 
     result = {"normal": {}, "shiny": {}, "female": {}, "official_artwork": {}, "animated": {}, "icons": {}}
 
@@ -337,21 +358,11 @@ def cards_data_complete(folder):
     except Exception:
         return False
 
-def complete(folder):
-    cards_folder = folder / "cards"
-    if not cards_folder.exists(): return False
-    cards_files = list(cards_folder.glob("*.jpg"))
-    if len(cards_files) == 0: return False
-
-    sprites_folder = folder / "sprites"
-    if not sprites_folder.exists(): return False
-
+def pokemon_json_valid(folder):
     path = folder / pokemonInfo
     if not path.exists(): return False
-
     try:
         data = load_json(path)
-
         required = [
             "nome", "numero_pokedex", "altura", "peso", "experiencia_base",
             "ordem", "lendario", "mitico", "bebe",
@@ -361,13 +372,50 @@ def complete(folder):
             "habilidades", "tipos", "relacoes_tipos",
             "estatisticas", "evolucoes", "experiencia_por_nivel"
         ]
-
         if not all(field in data for field in required): return False
 
         rel = data.get("relacoes_tipos", {})
         if "fraquezas" not in rel: return False
         if "resistencias" not in rel: return False
         if "imunidades" not in rel: return False
+
+        return True
+    except Exception:
+        return False
+
+def complete(folder):
+    if not pokemon_json_valid(folder): return False
+
+    manifest_path = folder / sprintesInfo
+    if not manifest_path.exists(): return False
+
+    cards_manifest_path = folder / cardsInfo
+    if not cards_manifest_path.exists(): return False
+
+    cards_json_path = folder / cardsData
+    if not cards_json_path.exists(): return False
+
+    try:
+        # Verify sprites complete
+        manifest = load_json(manifest_path)
+        if not manifest or "sprites" not in manifest: return False
+        sprite_map = manifest.get("sprites", {})
+        
+        is_manifest_empty = True
+        for cat, items in sprite_map.items():
+            if isinstance(items, dict) and any(items.values()):
+                is_manifest_empty = False
+                break
+        if is_manifest_empty: return False
+        if not sprites_complete(folder, sprite_map): return False
+
+        # Verify cards complete
+        cards_manifest = load_json(cards_manifest_path)
+        if not cards_manifest: return False
+        if not cards_complete(folder, cards_manifest): return False
+
+        # Verify cards data complete
+        if not cards_data_complete(folder): return False
 
         return True
     except Exception:
@@ -411,24 +459,36 @@ def process_pokemon(item, idx, total):
 
     sprite_data = None
 
-    if json_path.exists():
-        if complete(folder):
-            print("> Dataset completo (CACHE OK)")
-        else:
-            print("> JSON inválido — regenerando")
-            data, sprite_data, _ = build_pokemon(name)
-            save_json(json_path, data)
+    if pokemon_json_valid(folder):
+        print("> JSON OK")
     else:
-        print("> JSON ausente")
+        print("> JSON ausente ou inválido")
         data, sprite_data, _ = build_pokemon(name)
         save_json(json_path, data)
 
     manifest = load_json(manifest_path)
 
-    if manifest is None:
-        print("> Manifest ausente")
+    is_manifest_empty = True
+    if manifest and isinstance(manifest.get("sprites"), dict):
+        for cat, items in manifest["sprites"].items():
+            if isinstance(items, dict) and any(items.values()):
+                is_manifest_empty = False
+                break
 
-        if sprite_data is None: _, sprite_data, _ = build_pokemon(name)
+    if manifest is None or is_manifest_empty:
+        if manifest is None:
+            print("> Manifest ausente")
+        else:
+            print("> Manifest vazio — regenerando")
+
+        if sprite_data is None:
+            print("> Obtendo sprites do API")
+            try:
+                p = get(f"{BASE}/pokemon/{name}")
+                sprite_data = p.get("sprites", {})
+            except Exception as e:
+                print(f"Erro ao obter sprites de {name}: {e}")
+                sprite_data = {}
 
         sprite_map = extract_sprites(sprite_data)
         manifest = {"hash": hash_map(sprite_map), "sprites": {k: v if isinstance(v, dict) else {} for k, v in sprite_map.items()}}
@@ -470,16 +530,19 @@ def process_pokemon(item, idx, total):
     cards_manifest_path = folder / cardsInfo
     cards_manifest = load_json(cards_manifest_path)
 
+    cards = None
+    fetched_full_cards = False
+
     if cards_manifest is None:
         print("> Obtendo lista de cards")
 
         cards = fetch_cards(name)
+        fetched_full_cards = True
 
         cards_manifest = {
             "total": len(cards),
             "cards": [{"id": card["id"], "name": card["name"], "image": card["images"]["large"]} for card in cards]
         }
-
 
         save_json(cards_manifest_path, cards_manifest)
     else:
@@ -491,20 +554,22 @@ def process_pokemon(item, idx, total):
                 "images": {"large": card["image"]}
             } for card in cards_manifest.get("cards", [])]
 
-    if not cards_complete(folder, cards_manifest): download_cards_parallel(cards, folder)
-    else: print("> Cards OK")
+    if not cards_complete(folder, cards_manifest):
+        download_cards_parallel(cards, folder)
+    else:
+        print("> Cards OK")
 
     if not cards_data_complete(folder):
-        cards = fetch_cards(name)
+        if not fetched_full_cards:
+            print("> Obtendo dados dos cards")
+            cards = fetch_cards(name)
+            fetched_full_cards = True
 
         cards_json_path = folder / cardsData
 
         save_json(cards_json_path, {
             "total": len(cards),
-            "cards": [
-                {k: v for k, v in card.items() if k != "images"}
-                for card in cards
-            ]
+            "cards": [{k: v for k, v in card.items() if k != "images"} for card in cards]
         })
 
     print(f"Concluído: {name}")

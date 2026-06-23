@@ -84,10 +84,7 @@ def main():
     print(f"Locations encontradas: {total}")
 
     with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [
-            executor.submit(process_location, item, idx, total)
-            for idx, item in enumerate(locations, start=1)
-        ]
+        futures = [executor.submit(process_location, item, idx, total) for idx, item in enumerate(locations, start=1)]
 
         for future in as_completed(futures):
             try: future.result()

@@ -3,6 +3,7 @@ import json
 import hashlib
 import requests
 import traceback
+from threading import Semaphore
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -12,6 +13,8 @@ ITEM_INFO = "item.json"
 SPRITES_DIR = "sprites"
 SPRITES_INFO = "sprites_manifest.json"
 CACHE = {}
+DOWNLOAD_LIMIT = 5
+download_semaphore = Semaphore(DOWNLOAD_LIMIT)
 
 def get(url):
     if url in CACHE: return CACHE[url]
@@ -49,13 +52,15 @@ def download_file(url, path):
     if not url: return
     if path.exists(): return
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    with download_semaphore:
+        path.parent.mkdir(parents=True, exist_ok=True)
 
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    with open(path, "wb") as f: f.write(r.content)
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
 
-    print(f"Sprite salvo: {path}")
+        with open(path, "wb") as f: f.write(r.content)
+
+        print(f"Sprite salvo: {path}")
 
 def flatten_sprites(obj, prefix=""):
     result = {}
@@ -191,7 +196,7 @@ def main():
 
     print(f"Itens encontrados: {total}")
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(process_item, item, idx, total) for idx, item in enumerate(items, start=1)]
 
         for future in as_completed(futures):

@@ -70,10 +70,8 @@ def main():
         result = process_json_file(json_file)
 
         match result[0]:
-            case "formatted":
-                formatted_count += 1
-            case "skipped":
-                skipped_count += 1
+            case "formatted": formatted_count += 1
+            case "skipped": skipped_count += 1
             case "error":
                 error_count += 1
                 tqdm.write(f"✖ Erro em {result[1]}: {result[2]}")

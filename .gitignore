@@ -1,0 +1,21 @@
+# Pastas do projeto
+abilities/
+berries/
+encounter_methods/
+items/
+locations/
+movimentos/
+natures/
+pokemon/
+stats/
+super_contest_effects/
+tipos/
+
+# Arquivos compactados
+*.zip
+
+# Cache Python
+__pycache__/
+
+# Git já ignora sua própria pasta, mas pode deixar explícito
+.git/
